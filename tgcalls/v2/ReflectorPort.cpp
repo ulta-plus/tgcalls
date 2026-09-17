@@ -374,6 +374,9 @@ bool ReflectorPort::CreateReflectorClientSocket() {
         }
     } else if (server_address_.proto == cricket::PROTO_TCP) {
         RTC_DCHECK(!SharedSocket());
+        if (!underlying_socket_factory_) {
+            return false;
+        }
         int opts = 0;
 
         rtc::PacketSocketTcpOptions tcp_options;

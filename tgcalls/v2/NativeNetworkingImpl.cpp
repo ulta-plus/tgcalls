@@ -14,6 +14,7 @@
 #include "pc/dtls_transport.h"
 #include "pc/jsep_transport_controller.h"
 #include "api/async_dns_resolver.h"
+#include "Socks5UdpSocket.h"
 
 #include "TurnCustomizerImpl.h"
 #include "ReflectorRelayPortFactory.h"
@@ -173,8 +174,11 @@ private:
 
 class WrappedBasicPacketSocketFactory : public rtc::PacketSocketFactory {
 public:
-    WrappedBasicPacketSocketFactory(std::unique_ptr<rtc::BasicPacketSocketFactory> &&impl, bool standaloneReflectorMode) :
+    WrappedBasicPacketSocketFactory(std::unique_ptr<rtc::BasicPacketSocketFactory> &&impl, rtc::SocketFactory *underlying, absl::optional<rtc::SocketAddress> socksProxy, bool proxyRequired, bool standaloneReflectorMode) :
     _impl(std::move(impl)),
+    _underlying(underlying),
+    _socksProxy(std::move(socksProxy)),
+    _proxyRequired(proxyRequired),
     _standaloneReflectorMode(standaloneReflectorMode) {
     }
 
@@ -187,13 +191,24 @@ public:
         rtc::IPAddress ipAddress(v4addr);
         if (_standaloneReflectorMode && address.ipaddr() == ipAddress && address.port() != 12345) {
             return nullptr;
-        } else {
-            rtc::SocketAddress updatedAddress = address;
-            if (updatedAddress.port() == 12345) {
-                updatedAddress.SetPort(0);
-            }
-            return _impl->CreateUdpSocket(updatedAddress, min_port, max_port);
         }
+        auto updatedAddress = address;
+        if (updatedAddress.port() == 12345) {
+            updatedAddress.SetPort(0);
+        }
+        if (_proxyRequired && !_socksProxy) {
+            return nullptr;
+        }
+        if (_socksProxy) {
+            auto socket = new rtc::AsyncSocksProxyUdpSocket(
+                _underlying, updatedAddress, *_socksProxy);
+            if (!socket->IsBound()) {
+                delete socket;
+                return nullptr;
+            }
+            return socket;
+        }
+        return _impl->CreateUdpSocket(updatedAddress, min_port, max_port);
     }
     
     virtual rtc::AsyncListenSocket *CreateServerTcpSocket(const rtc::SocketAddress &local_address, uint16_t min_port, uint16_t max_port, int opts) override {
@@ -211,11 +226,10 @@ public:
         in_addr v4addr;
         inet_pton(AF_INET, "0.1.2.3", &v4addr);
         rtc::IPAddress ipAddress(v4addr);
-        if (_standaloneReflectorMode && local_address.ipaddr() == ipAddress) {
+        if (_socksProxy || (_standaloneReflectorMode && local_address.ipaddr() == ipAddress)) {
             return nullptr;
-        } else {
-            return _impl->CreateClientTcpSocket(local_address, remote_address, proxy_info, user_agent, tcp_options);
         }
+        return _impl->CreateClientTcpSocket(local_address, remote_address, proxy_info, user_agent, tcp_options);
     }
 
     virtual std::unique_ptr<webrtc::AsyncDnsResolverInterface> CreateAsyncDnsResolver() override {
@@ -223,6 +237,9 @@ public:
     }
 private:
     std::unique_ptr<rtc::BasicPacketSocketFactory> _impl;
+    rtc::SocketFactory *_underlying = nullptr;
+    absl::optional<rtc::SocketAddress> _socksProxy;
+    bool _proxyRequired = false;
     bool _standaloneReflectorMode = false;
 };
 
@@ -519,11 +536,24 @@ _dataChannelMessageReceived(configuration.dataChannelMessageReceived) {
     _underlyingSocketFactory = _threads->getNetworkThread()->socketserver();
     
     _networkMonitorFactory = PlatformInterface::SharedInstance()->createNetworkMonitorFactory();
-    if (getCustomParameterBool(_customParameters, "network_standalone_reflectors")) {
-        _socketFactory = std::make_unique<WrappedBasicPacketSocketFactory>(std::make_unique<rtc::BasicPacketSocketFactory>(_threads->getNetworkThread()->socketserver()), true);
+    const auto standalone = getCustomParameterBool(_customParameters, "network_standalone_reflectors");
+    const auto proxyRequired = _proxy && _proxy->useSocks5Udp;
+    auto socksProxy = absl::optional<rtc::SocketAddress>();
+    if (proxyRequired) {
+        const auto address = rtc::SocketAddress(_proxy->host, _proxy->port);
+        if (!address.IsUnresolvedIP() && address.IsLoopbackIP() && _proxy->port) {
+            socksProxy = address;
+        }
+    }
+    _socketFactory = std::make_unique<WrappedBasicPacketSocketFactory>(
+        std::make_unique<rtc::BasicPacketSocketFactory>(_threads->getNetworkThread()->socketserver()),
+        _threads->getNetworkThread()->socketserver(),
+        std::move(socksProxy),
+        proxyRequired,
+        standalone);
+    if (standalone) {
         _networkManager = std::make_unique<WrappedNetworkManager>(_networkMonitorFactory.get(), _threads->getNetworkThread()->socketserver());
     } else {
-        _socketFactory = std::make_unique<rtc::BasicPacketSocketFactory>(_threads->getNetworkThread()->socketserver());
         _networkManager = std::make_unique<rtc::BasicNetworkManager>(_networkMonitorFactory.get(), _threads->getNetworkThread()->socketserver());
     }
     
@@ -564,6 +594,7 @@ NativeNetworkingImpl::~NativeNetworkingImpl() {
 }
 
 void NativeNetworkingImpl::resetDtlsSrtpTransport() {
+    const auto useSocksUdpProxy = _proxy && _proxy->useSocks5Udp;
     if (_enableStunMarking) {
         _turnCustomizer.reset(new TurnCustomizerImpl());
     }
@@ -579,7 +610,13 @@ void NativeNetworkingImpl::resetDtlsSrtpTransport() {
         }
     }
     
-    _relayPortFactory.reset(new ReflectorRelayPortFactory(_rtcServers, standaloneReflectorMode, standaloneReflectorRoleId, _underlyingSocketFactory));
+    _relayPortFactory.reset(new ReflectorRelayPortFactory(
+        _rtcServers,
+        standaloneReflectorMode,
+        standaloneReflectorRoleId,
+        socks5::ReflectorRawSocketFactory(
+            _underlyingSocketFactory,
+            useSocksUdpProxy)));
 
     _portAllocator.reset(new cricket::BasicPortAllocator(_networkManager.get(), _socketFactory.get(), _turnCustomizer.get(), _relayPortFactory.get()));
 
@@ -597,11 +634,14 @@ void NativeNetworkingImpl::resetDtlsSrtpTransport() {
         cricket::PORTALLOCATOR_ENABLE_IPV6 |
         cricket::PORTALLOCATOR_ENABLE_IPV6_ON_WIFI;
 
-    if (!_enableTCP) {
+    if (useSocksUdpProxy || !_enableTCP) {
         flags |= cricket::PORTALLOCATOR_DISABLE_TCP;
     }
     
-    if (_proxy || !_enableP2P) {
+    if (socks5::ShouldDisableDirectUdpAndStun(
+            _proxy.has_value(),
+            useSocksUdpProxy,
+            _enableP2P)) {
         flags |= cricket::PORTALLOCATOR_DISABLE_UDP;
         flags |= cricket::PORTALLOCATOR_DISABLE_STUN;
         uint32_t candidateFilter = _portAllocator->candidate_filter();
@@ -618,16 +658,20 @@ void NativeNetworkingImpl::resetDtlsSrtpTransport() {
     std::vector<cricket::RelayServerConfig> turnServers;
 
     for (auto &server : _rtcServers) {
+        const auto address = rtc::SocketAddress(server.host, server.port);
+        if (address.IsUnresolvedIP() || !server.port
+            || (useSocksUdpProxy && server.isTcp)) {
+            continue;
+        }
         if (server.isTurn) {
             turnServers.push_back(cricket::RelayServerConfig(
-                rtc::SocketAddress(server.host, server.port),
+                address,
                 server.login,
                 server.password,
                 server.isTcp ? cricket::PROTO_TCP : cricket::PROTO_UDP
             ));
         } else {
-            rtc::SocketAddress stunAddress = rtc::SocketAddress(server.host, server.port);
-            stunServers.insert(stunAddress);
+            stunServers.insert(address);
         }
     }
 

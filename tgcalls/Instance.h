@@ -42,6 +42,7 @@ struct Proxy {
 	uint16_t port = 0;
 	std::string login;
 	std::string password;
+	bool useSocks5Udp = false;
 };
 
 struct RtcServer {
